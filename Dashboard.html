@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dashboard - MemoryBox</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f0f0f0;
+            margin: 0;
+            padding: 20px;
+        }
+        .memory-card {
+            background: white;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 8px;
+            box-shadow: 0 0 5px rgba(0,0,0,0.2);
+        }
+        img {
+            width: 200px;
+            border-radius: 5px;
+        }
+        .top-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        a {
+            text-decoration: none;
+            background: #007bff;
+            color: white;
+            padding: 8px 14px;
+            border-radius: 5px;
+        }
+        h3 {
+            margin-top: 40px;
+        }
+        .locked {
+            opacity: 0.5;
+        }
+    </style>
+</head>
+<body>
+
+<div class="top-bar">
+    <h2>Welcome, {{ current_user.id }}</h2>
+    <a href="/logout">Logout</a>
+</div>
+
+<a href="/upload">Upload New Memory</a>
+
+<h3>Unlocked Memories</h3>
+{% if unlocked %}
+    {% for memory in unlocked %}
+        <div class="memory-card">
+            <img src="{{ url_for('static', filename='uploads/' ~ memory['filename']) }}" alt="Memory">
+            <p><strong>Unlock Date:</strong> {{ memory['unlock_date'] }}</p>
+        </div>
+    {% endfor %}
+{% else %}
+    <p>No unlocked memories yet.</p>
+{% endif %}
+
+<h3>Locked Memories</h3>
+{% if locked %}
+    {% for memory in locked %}
+        <div class="memory-card locked">
+            <img src="{{ url_for('static', filename='uploads/' ~ memory['filename']) }}" alt="Memory">
+            <p><strong>Unlock Date:</strong> {{ memory['unlock_date'] }}</p>
+            <p><em>Locked until this date</em></p>
+        </div>
+    {% endfor %}
+{% else %}
+    <p>No locked memories.</p>
+{% endif %}
+
+</body>
+</html>

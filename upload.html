@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Login - MemoryBox</title>
+    <title>Upload Memory - MemoryBox</title>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -12,11 +12,11 @@
             background: white;
             padding: 20px;
             border-radius: 8px;
-            max-width: 400px;
+            max-width: 500px;
             margin: auto;
             box-shadow: 0 0 5px rgba(0,0,0,0.2);
         }
-        input[type="email"], input[type="password"], button {
+        input[type="file"], input[type="date"], button {
             width: 100%;
             padding: 10px;
             margin: 10px 0;
@@ -34,35 +34,32 @@
             text-decoration: none;
             color: #007bff;
         }
-        p.flash {
-            color: red;
-        }
     </style>
 </head>
 <body>
 
 <div class="container">
-    <h2>Login</h2>
+    <h2>Upload New Memory</h2>
 
     {% with messages = get_flashed_messages() %}
       {% if messages %}
         {% for msg in messages %}
-          <p class="flash">{{ msg }}</p>
+          <p style="color:red;">{{ msg }}</p>
         {% endfor %}
       {% endif %}
     {% endwith %}
 
-    <form action="/login" method="POST">
-        <label>Email:</label>
-        <input type="email" name="email" placeholder="Enter email" required>
+    <form action="/upload" method="POST" enctype="multipart/form-data">
+        <label>Select File (photo, video, audio, note):</label>
+        <input type="file" name="file" required>
 
-        <label>Password:</label>
-        <input type="password" name="password" placeholder="Enter password" required>
+        <label>Unlock Date:</label>
+        <input type="date" name="unlock_date" required>
 
-        <button type="submit">Login</button>
+        <button type="submit">Upload</button>
     </form>
 
-    <p>Don't have an account? <a href="/signup">Sign up</a></p>
+    <a href="/dashboard">Back to Dashboard</a>
 </div>
 
 </body>

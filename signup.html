@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Login - MemoryBox</title>
+    <title>Sign Up - MemoryBox</title>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -42,7 +42,7 @@
 <body>
 
 <div class="container">
-    <h2>Login</h2>
+    <h2>Sign Up</h2>
 
     {% with messages = get_flashed_messages() %}
       {% if messages %}
@@ -52,17 +52,17 @@
       {% endif %}
     {% endwith %}
 
-    <form action="/login" method="POST">
+    <form action="/signup" method="POST">
         <label>Email:</label>
         <input type="email" name="email" placeholder="Enter email" required>
 
         <label>Password:</label>
         <input type="password" name="password" placeholder="Enter password" required>
 
-        <button type="submit">Login</button>
+        <button type="submit">Sign Up</button>
     </form>
 
-    <p>Don't have an account? <a href="/signup">Sign up</a></p>
+    <p>Already have an account? <a href="/login">Login</a></p>
 </div>
 
 </body>
