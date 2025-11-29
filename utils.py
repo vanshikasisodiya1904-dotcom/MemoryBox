@@ -1,627 +1,766 @@
-from __future__ import annotations
-
-import collections.abc as cabc
+import enum
+import json
 import os
 import re
-import sys
 import typing as t
-from functools import update_wrapper
-from types import ModuleType
-from types import TracebackType
+from collections import abc
+from collections import deque
+from random import choice
+from random import randrange
+from threading import Lock
+from types import CodeType
+from urllib.parse import quote_from_bytes
 
-from ._compat import _default_text_stderr
-from ._compat import _default_text_stdout
-from ._compat import _find_binary_writer
-from ._compat import auto_wrap_for_ansi
-from ._compat import binary_streams
-from ._compat import open_stream
-from ._compat import should_strip_ansi
-from ._compat import strip_ansi
-from ._compat import text_streams
-from ._compat import WIN
-from .globals import resolve_color_default
+import markupsafe
 
 if t.TYPE_CHECKING:
     import typing_extensions as te
 
-    P = te.ParamSpec("P")
-
-R = t.TypeVar("R")
+F = t.TypeVar("F", bound=t.Callable[..., t.Any])
 
 
-def _posixify(name: str) -> str:
-    return "-".join(name.split()).lower()
-
-
-def safecall(func: t.Callable[P, R]) -> t.Callable[P, R | None]:
-    """Wraps a function so that it swallows exceptions."""
-
-    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R | None:
-        try:
-            return func(*args, **kwargs)
-        except Exception:
-            pass
-        return None
-
-    return update_wrapper(wrapper, func)
-
-
-def make_str(value: t.Any) -> str:
-    """Converts a value into a valid string."""
-    if isinstance(value, bytes):
-        try:
-            return value.decode(sys.getfilesystemencoding())
-        except UnicodeError:
-            return value.decode("utf-8", "replace")
-    return str(value)
-
-
-def make_default_short_help(help: str, max_length: int = 45) -> str:
-    """Returns a condensed version of help string."""
-    # Consider only the first paragraph.
-    paragraph_end = help.find("\n\n")
-
-    if paragraph_end != -1:
-        help = help[:paragraph_end]
-
-    # Collapse newlines, tabs, and spaces.
-    words = help.split()
-
-    if not words:
-        return ""
-
-    # The first paragraph started with a "no rewrap" marker, ignore it.
-    if words[0] == "\b":
-        words = words[1:]
-
-    total_length = 0
-    last_index = len(words) - 1
-
-    for i, word in enumerate(words):
-        total_length += len(word) + (i > 0)
-
-        if total_length > max_length:  # too long, truncate
-            break
-
-        if word[-1] == ".":  # sentence end, truncate without "..."
-            return " ".join(words[: i + 1])
-
-        if total_length == max_length and i != last_index:
-            break  # not at sentence end, truncate with "..."
-    else:
-        return " ".join(words)  # no truncation needed
-
-    # Account for the length of the suffix.
-    total_length += len("...")
-
-    # remove words until the length is short enough
-    while i > 0:
-        total_length -= len(words[i]) + (i > 0)
-
-        if total_length <= max_length:
-            break
-
-        i -= 1
-
-    return " ".join(words[:i]) + "..."
-
-
-class LazyFile:
-    """A lazy file works like a regular file but it does not fully open
-    the file but it does perform some basic checks early to see if the
-    filename parameter does make sense.  This is useful for safely opening
-    files for writing.
-    """
-
-    def __init__(
-        self,
-        filename: str | os.PathLike[str],
-        mode: str = "r",
-        encoding: str | None = None,
-        errors: str | None = "strict",
-        atomic: bool = False,
-    ):
-        self.name: str = os.fspath(filename)
-        self.mode = mode
-        self.encoding = encoding
-        self.errors = errors
-        self.atomic = atomic
-        self._f: t.IO[t.Any] | None
-        self.should_close: bool
-
-        if self.name == "-":
-            self._f, self.should_close = open_stream(filename, mode, encoding, errors)
-        else:
-            if "r" in mode:
-                # Open and close the file in case we're opening it for
-                # reading so that we can catch at least some errors in
-                # some cases early.
-                open(filename, mode).close()
-            self._f = None
-            self.should_close = True
-
-    def __getattr__(self, name: str) -> t.Any:
-        return getattr(self.open(), name)
-
+class _MissingType:
     def __repr__(self) -> str:
-        if self._f is not None:
-            return repr(self._f)
-        return f"<unopened file '{format_filename(self.name)}' {self.mode}>"
+        return "missing"
 
-    def open(self) -> t.IO[t.Any]:
-        """Opens the file if it's not yet open.  This call might fail with
-        a :exc:`FileError`.  Not handling this error will produce an error
-        that Click shows.
-        """
-        if self._f is not None:
-            return self._f
-        try:
-            rv, self.should_close = open_stream(
-                self.name, self.mode, self.encoding, self.errors, atomic=self.atomic
-            )
-        except OSError as e:
-            from .exceptions import FileError
-
-            raise FileError(self.name, hint=e.strerror) from e
-        self._f = rv
-        return rv
-
-    def close(self) -> None:
-        """Closes the underlying file, no matter what."""
-        if self._f is not None:
-            self._f.close()
-
-    def close_intelligently(self) -> None:
-        """This function only closes the file if it was opened by the lazy
-        file wrapper.  For instance this will never close stdin.
-        """
-        if self.should_close:
-            self.close()
-
-    def __enter__(self) -> LazyFile:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.close_intelligently()
-
-    def __iter__(self) -> cabc.Iterator[t.AnyStr]:
-        self.open()
-        return iter(self._f)  # type: ignore
+    def __reduce__(self) -> str:
+        return "missing"
 
 
-class KeepOpenFile:
-    def __init__(self, file: t.IO[t.Any]) -> None:
-        self._file: t.IO[t.Any] = file
+missing: t.Any = _MissingType()
+"""Special singleton representing missing values for the runtime."""
 
-    def __getattr__(self, name: str) -> t.Any:
-        return getattr(self._file, name)
+internal_code: t.MutableSet[CodeType] = set()
 
-    def __enter__(self) -> KeepOpenFile:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        pass
-
-    def __repr__(self) -> str:
-        return repr(self._file)
-
-    def __iter__(self) -> cabc.Iterator[t.AnyStr]:
-        return iter(self._file)
+concat = "".join
 
 
-def echo(
-    message: t.Any | None = None,
-    file: t.IO[t.Any] | None = None,
-    nl: bool = True,
-    err: bool = False,
-    color: bool | None = None,
-) -> None:
-    """Print a message and newline to stdout or a file. This should be
-    used instead of :func:`print` because it provides better support
-    for different data, files, and environments.
+def pass_context(f: F) -> F:
+    """Pass the :class:`~jinja2.runtime.Context` as the first argument
+    to the decorated function when called while rendering a template.
 
-    Compared to :func:`print`, this does the following:
+    Can be used on functions, filters, and tests.
 
-    -   Ensures that the output encoding is not misconfigured on Linux.
-    -   Supports Unicode in the Windows console.
-    -   Supports writing to binary outputs, and supports writing bytes
-        to text outputs.
-    -   Supports colors and styles on Windows.
-    -   Removes ANSI color and style codes if the output does not look
-        like an interactive terminal.
-    -   Always flushes the output.
+    If only ``Context.eval_context`` is needed, use
+    :func:`pass_eval_context`. If only ``Context.environment`` is
+    needed, use :func:`pass_environment`.
 
-    :param message: The string or bytes to output. Other objects are
-        converted to strings.
-    :param file: The file to write to. Defaults to ``stdout``.
-    :param err: Write to ``stderr`` instead of ``stdout``.
-    :param nl: Print a newline after the message. Enabled by default.
-    :param color: Force showing or hiding colors and other styles. By
-        default Click will remove color if the output does not look like
-        an interactive terminal.
-
-    .. versionchanged:: 6.0
-        Support Unicode output on the Windows console. Click does not
-        modify ``sys.stdout``, so ``sys.stdout.write()`` and ``print()``
-        will still not support Unicode.
-
-    .. versionchanged:: 4.0
-        Added the ``color`` parameter.
-
-    .. versionadded:: 3.0
-        Added the ``err`` parameter.
-
-    .. versionchanged:: 2.0
-        Support colors on Windows if colorama is installed.
+    .. versionadded:: 3.0.0
+        Replaces ``contextfunction`` and ``contextfilter``.
     """
-    if file is None:
-        if err:
-            file = _default_text_stderr()
-        else:
-            file = _default_text_stdout()
-
-        # There are no standard streams attached to write to. For example,
-        # pythonw on Windows.
-        if file is None:
-            return
-
-    # Convert non bytes/text into the native string type.
-    if message is not None and not isinstance(message, (str, bytes, bytearray)):
-        out: str | bytes | bytearray | None = str(message)
-    else:
-        out = message
-
-    if nl:
-        out = out or ""
-        if isinstance(out, str):
-            out += "\n"
-        else:
-            out += b"\n"
-
-    if not out:
-        file.flush()
-        return
-
-    # If there is a message and the value looks like bytes, we manually
-    # need to find the binary stream and write the message in there.
-    # This is done separately so that most stream types will work as you
-    # would expect. Eg: you can write to StringIO for other cases.
-    if isinstance(out, (bytes, bytearray)):
-        binary_file = _find_binary_writer(file)
-
-        if binary_file is not None:
-            file.flush()
-            binary_file.write(out)
-            binary_file.flush()
-            return
-
-    # ANSI style code support. For no message or bytes, nothing happens.
-    # When outputting to a file instead of a terminal, strip codes.
-    else:
-        color = resolve_color_default(color)
-
-        if should_strip_ansi(file, color):
-            out = strip_ansi(out)
-        elif WIN:
-            if auto_wrap_for_ansi is not None:
-                file = auto_wrap_for_ansi(file, color)  # type: ignore
-            elif not color:
-                out = strip_ansi(out)
-
-    file.write(out)  # type: ignore
-    file.flush()
-
-
-def get_binary_stream(name: t.Literal["stdin", "stdout", "stderr"]) -> t.BinaryIO:
-    """Returns a system stream for byte processing.
-
-    :param name: the name of the stream to open.  Valid names are ``'stdin'``,
-                 ``'stdout'`` and ``'stderr'``
-    """
-    opener = binary_streams.get(name)
-    if opener is None:
-        raise TypeError(f"Unknown standard stream '{name}'")
-    return opener()
-
-
-def get_text_stream(
-    name: t.Literal["stdin", "stdout", "stderr"],
-    encoding: str | None = None,
-    errors: str | None = "strict",
-) -> t.TextIO:
-    """Returns a system stream for text processing.  This usually returns
-    a wrapped stream around a binary stream returned from
-    :func:`get_binary_stream` but it also can take shortcuts for already
-    correctly configured streams.
-
-    :param name: the name of the stream to open.  Valid names are ``'stdin'``,
-                 ``'stdout'`` and ``'stderr'``
-    :param encoding: overrides the detected default encoding.
-    :param errors: overrides the default error mode.
-    """
-    opener = text_streams.get(name)
-    if opener is None:
-        raise TypeError(f"Unknown standard stream '{name}'")
-    return opener(encoding, errors)
-
-
-def open_file(
-    filename: str | os.PathLike[str],
-    mode: str = "r",
-    encoding: str | None = None,
-    errors: str | None = "strict",
-    lazy: bool = False,
-    atomic: bool = False,
-) -> t.IO[t.Any]:
-    """Open a file, with extra behavior to handle ``'-'`` to indicate
-    a standard stream, lazy open on write, and atomic write. Similar to
-    the behavior of the :class:`~click.File` param type.
-
-    If ``'-'`` is given to open ``stdout`` or ``stdin``, the stream is
-    wrapped so that using it in a context manager will not close it.
-    This makes it possible to use the function without accidentally
-    closing a standard stream:
-
-    .. code-block:: python
-
-        with open_file(filename) as f:
-            ...
-
-    :param filename: The name or Path of the file to open, or ``'-'`` for
-        ``stdin``/``stdout``.
-    :param mode: The mode in which to open the file.
-    :param encoding: The encoding to decode or encode a file opened in
-        text mode.
-    :param errors: The error handling mode.
-    :param lazy: Wait to open the file until it is accessed. For read
-        mode, the file is temporarily opened to raise access errors
-        early, then closed until it is read again.
-    :param atomic: Write to a temporary file and replace the given file
-        on close.
-
-    .. versionadded:: 3.0
-    """
-    if lazy:
-        return t.cast(
-            "t.IO[t.Any]", LazyFile(filename, mode, encoding, errors, atomic=atomic)
-        )
-
-    f, should_close = open_stream(filename, mode, encoding, errors, atomic=atomic)
-
-    if not should_close:
-        f = t.cast("t.IO[t.Any]", KeepOpenFile(f))
-
+    f.jinja_pass_arg = _PassArg.context  # type: ignore
     return f
 
 
-def format_filename(
-    filename: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-    shorten: bool = False,
+def pass_eval_context(f: F) -> F:
+    """Pass the :class:`~jinja2.nodes.EvalContext` as the first argument
+    to the decorated function when called while rendering a template.
+    See :ref:`eval-context`.
+
+    Can be used on functions, filters, and tests.
+
+    If only ``EvalContext.environment`` is needed, use
+    :func:`pass_environment`.
+
+    .. versionadded:: 3.0.0
+        Replaces ``evalcontextfunction`` and ``evalcontextfilter``.
+    """
+    f.jinja_pass_arg = _PassArg.eval_context  # type: ignore
+    return f
+
+
+def pass_environment(f: F) -> F:
+    """Pass the :class:`~jinja2.Environment` as the first argument to
+    the decorated function when called while rendering a template.
+
+    Can be used on functions, filters, and tests.
+
+    .. versionadded:: 3.0.0
+        Replaces ``environmentfunction`` and ``environmentfilter``.
+    """
+    f.jinja_pass_arg = _PassArg.environment  # type: ignore
+    return f
+
+
+class _PassArg(enum.Enum):
+    context = enum.auto()
+    eval_context = enum.auto()
+    environment = enum.auto()
+
+    @classmethod
+    def from_obj(cls, obj: F) -> t.Optional["_PassArg"]:
+        if hasattr(obj, "jinja_pass_arg"):
+            return obj.jinja_pass_arg  # type: ignore
+
+        return None
+
+
+def internalcode(f: F) -> F:
+    """Marks the function as internally used"""
+    internal_code.add(f.__code__)
+    return f
+
+
+def is_undefined(obj: t.Any) -> bool:
+    """Check if the object passed is undefined.  This does nothing more than
+    performing an instance check against :class:`Undefined` but looks nicer.
+    This can be used for custom filters or tests that want to react to
+    undefined variables.  For example a custom default filter can look like
+    this::
+
+        def default(var, default=''):
+            if is_undefined(var):
+                return default
+            return var
+    """
+    from .runtime import Undefined
+
+    return isinstance(obj, Undefined)
+
+
+def consume(iterable: t.Iterable[t.Any]) -> None:
+    """Consumes an iterable without doing anything with it."""
+    for _ in iterable:
+        pass
+
+
+def clear_caches() -> None:
+    """Jinja keeps internal caches for environments and lexers.  These are
+    used so that Jinja doesn't have to recreate environments and lexers all
+    the time.  Normally you don't have to care about that but if you are
+    measuring memory consumption you may want to clean the caches.
+    """
+    from .environment import get_spontaneous_environment
+    from .lexer import _lexer_cache
+
+    get_spontaneous_environment.cache_clear()
+    _lexer_cache.clear()
+
+
+def import_string(import_name: str, silent: bool = False) -> t.Any:
+    """Imports an object based on a string.  This is useful if you want to
+    use import paths as endpoints or something similar.  An import path can
+    be specified either in dotted notation (``xml.sax.saxutils.escape``)
+    or with a colon as object delimiter (``xml.sax.saxutils:escape``).
+
+    If the `silent` is True the return value will be `None` if the import
+    fails.
+
+    :return: imported object
+    """
+    try:
+        if ":" in import_name:
+            module, obj = import_name.split(":", 1)
+        elif "." in import_name:
+            module, _, obj = import_name.rpartition(".")
+        else:
+            return __import__(import_name)
+        return getattr(__import__(module, None, None, [obj]), obj)
+    except (ImportError, AttributeError):
+        if not silent:
+            raise
+
+
+def open_if_exists(filename: str, mode: str = "rb") -> t.Optional[t.IO[t.Any]]:
+    """Returns a file descriptor for the filename if that file exists,
+    otherwise ``None``.
+    """
+    if not os.path.isfile(filename):
+        return None
+
+    return open(filename, mode)
+
+
+def object_type_repr(obj: t.Any) -> str:
+    """Returns the name of the object's type.  For some recognized
+    singletons the name of the object is returned instead. (For
+    example for `None` and `Ellipsis`).
+    """
+    if obj is None:
+        return "None"
+    elif obj is Ellipsis:
+        return "Ellipsis"
+
+    cls = type(obj)
+
+    if cls.__module__ == "builtins":
+        return f"{cls.__name__} object"
+
+    return f"{cls.__module__}.{cls.__name__} object"
+
+
+def pformat(obj: t.Any) -> str:
+    """Format an object using :func:`pprint.pformat`."""
+    from pprint import pformat
+
+    return pformat(obj)
+
+
+_http_re = re.compile(
+    r"""
+    ^
+    (
+        (https?://|www\.)  # scheme or www
+        (([\w%-]+\.)+)?  # subdomain
+        (
+            [a-z]{2,63}  # basic tld
+        |
+            xn--[\w%]{2,59}  # idna tld
+        )
+    |
+        ([\w%-]{2,63}\.)+  # basic domain
+        (com|net|int|edu|gov|org|info|mil)  # basic tld
+    |
+        (https?://)  # scheme
+        (
+            (([\d]{1,3})(\.[\d]{1,3}){3})  # IPv4
+        |
+            (\[([\da-f]{0,4}:){2}([\da-f]{0,4}:?){1,6}])  # IPv6
+        )
+    )
+    (?::[\d]{1,5})?  # port
+    (?:[/?#]\S*)?  # path, query, and fragment
+    $
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_email_re = re.compile(r"^\S+@\w[\w.-]*\.\w+$")
+
+
+def urlize(
+    text: str,
+    trim_url_limit: t.Optional[int] = None,
+    rel: t.Optional[str] = None,
+    target: t.Optional[str] = None,
+    extra_schemes: t.Optional[t.Iterable[str]] = None,
 ) -> str:
-    """Format a filename as a string for display. Ensures the filename can be
-    displayed by replacing any invalid bytes or surrogate escapes in the name
-    with the replacement character ``�``.
+    """Convert URLs in text into clickable links.
 
-    Invalid bytes or surrogate escapes will raise an error when written to a
-    stream with ``errors="strict"``. This will typically happen with ``stdout``
-    when the locale is something like ``en_GB.UTF-8``.
+    This may not recognize links in some situations. Usually, a more
+    comprehensive formatter, such as a Markdown library, is a better
+    choice.
 
-    Many scenarios *are* safe to write surrogates though, due to PEP 538 and
-    PEP 540, including:
+    Works on ``http://``, ``https://``, ``www.``, ``mailto:``, and email
+    addresses. Links with trailing punctuation (periods, commas, closing
+    parentheses) and leading punctuation (opening parentheses) are
+    recognized excluding the punctuation. Email addresses that include
+    header fields are not recognized (for example,
+    ``mailto:address@example.com?cc=copy@example.com``).
 
-    -   Writing to ``stderr``, which uses ``errors="backslashreplace"``.
-    -   The system has ``LANG=C.UTF-8``, ``C``, or ``POSIX``. Python opens
-        stdout and stderr with ``errors="surrogateescape"``.
-    -   None of ``LANG/LC_*`` are set. Python assumes ``LANG=C.UTF-8``.
-    -   Python is started in UTF-8 mode  with  ``PYTHONUTF8=1`` or ``-X utf8``.
-        Python opens stdout and stderr with ``errors="surrogateescape"``.
+    :param text: Original text containing URLs to link.
+    :param trim_url_limit: Shorten displayed URL values to this length.
+    :param target: Add the ``target`` attribute to links.
+    :param rel: Add the ``rel`` attribute to links.
+    :param extra_schemes: Recognize URLs that start with these schemes
+        in addition to the default behavior.
 
-    :param filename: formats a filename for UI display.  This will also convert
-                     the filename into unicode without failing.
-    :param shorten: this optionally shortens the filename to strip of the
-                    path that leads up to it.
+    .. versionchanged:: 3.0
+        The ``extra_schemes`` parameter was added.
+
+    .. versionchanged:: 3.0
+        Generate ``https://`` links for URLs without a scheme.
+
+    .. versionchanged:: 3.0
+        The parsing rules were updated. Recognize email addresses with
+        or without the ``mailto:`` scheme. Validate IP addresses. Ignore
+        parentheses and brackets in more cases.
     """
-    if shorten:
-        filename = os.path.basename(filename)
+    if trim_url_limit is not None:
+
+        def trim_url(x: str) -> str:
+            if len(x) > trim_url_limit:
+                return f"{x[:trim_url_limit]}..."
+
+            return x
+
     else:
-        filename = os.fspath(filename)
 
-    if isinstance(filename, bytes):
-        filename = filename.decode(sys.getfilesystemencoding(), "replace")
-    else:
-        filename = filename.encode("utf-8", "surrogateescape").decode(
-            "utf-8", "replace"
-        )
+        def trim_url(x: str) -> str:
+            return x
 
-    return filename
+    words = re.split(r"(\s+)", str(markupsafe.escape(text)))
+    rel_attr = f' rel="{markupsafe.escape(rel)}"' if rel else ""
+    target_attr = f' target="{markupsafe.escape(target)}"' if target else ""
+
+    for i, word in enumerate(words):
+        head, middle, tail = "", word, ""
+        match = re.match(r"^([(<]|&lt;)+", middle)
+
+        if match:
+            head = match.group()
+            middle = middle[match.end() :]
+
+        # Unlike lead, which is anchored to the start of the string,
+        # need to check that the string ends with any of the characters
+        # before trying to match all of them, to avoid backtracking.
+        if middle.endswith((")", ">", ".", ",", "\n", "&gt;")):
+            match = re.search(r"([)>.,\n]|&gt;)+$", middle)
+
+            if match:
+                tail = match.group()
+                middle = middle[: match.start()]
+
+        # Prefer balancing parentheses in URLs instead of ignoring a
+        # trailing character.
+        for start_char, end_char in ("(", ")"), ("<", ">"), ("&lt;", "&gt;"):
+            start_count = middle.count(start_char)
+
+            if start_count <= middle.count(end_char):
+                # Balanced, or lighter on the left
+                continue
+
+            # Move as many as possible from the tail to balance
+            for _ in range(min(start_count, tail.count(end_char))):
+                end_index = tail.index(end_char) + len(end_char)
+                # Move anything in the tail before the end char too
+                middle += tail[:end_index]
+                tail = tail[end_index:]
+
+        if _http_re.match(middle):
+            if middle.startswith("https://") or middle.startswith("http://"):
+                middle = (
+                    f'<a href="{middle}"{rel_attr}{target_attr}>{trim_url(middle)}</a>'
+                )
+            else:
+                middle = (
+                    f'<a href="https://{middle}"{rel_attr}{target_attr}>'
+                    f"{trim_url(middle)}</a>"
+                )
+
+        elif middle.startswith("mailto:") and _email_re.match(middle[7:]):
+            middle = f'<a href="{middle}">{middle[7:]}</a>'
+
+        elif (
+            "@" in middle
+            and not middle.startswith("www.")
+            # ignore values like `@a@b`
+            and not middle.startswith("@")
+            and ":" not in middle
+            and _email_re.match(middle)
+        ):
+            middle = f'<a href="mailto:{middle}">{middle}</a>'
+
+        elif extra_schemes is not None:
+            for scheme in extra_schemes:
+                if middle != scheme and middle.startswith(scheme):
+                    middle = f'<a href="{middle}"{rel_attr}{target_attr}>{middle}</a>'
+
+        words[i] = f"{head}{middle}{tail}"
+
+    return "".join(words)
 
 
-def get_app_dir(app_name: str, roaming: bool = True, force_posix: bool = False) -> str:
-    r"""Returns the config folder for the application.  The default behavior
-    is to return whatever is most appropriate for the operating system.
+def generate_lorem_ipsum(
+    n: int = 5, html: bool = True, min: int = 20, max: int = 100
+) -> str:
+    """Generate some lorem ipsum for the template."""
+    from .constants import LOREM_IPSUM_WORDS
 
-    To give you an idea, for an app called ``"Foo Bar"``, something like
-    the following folders could be returned:
+    words = LOREM_IPSUM_WORDS.split()
+    result = []
 
-    Mac OS X:
-      ``~/Library/Application Support/Foo Bar``
-    Mac OS X (POSIX):
-      ``~/.foo-bar``
-    Unix:
-      ``~/.config/foo-bar``
-    Unix (POSIX):
-      ``~/.foo-bar``
-    Windows (roaming):
-      ``C:\Users\<user>\AppData\Roaming\Foo Bar``
-    Windows (not roaming):
-      ``C:\Users\<user>\AppData\Local\Foo Bar``
+    for _ in range(n):
+        next_capitalized = True
+        last_comma = last_fullstop = 0
+        word = None
+        last = None
+        p = []
 
-    .. versionadded:: 2.0
+        # each paragraph contains out of 20 to 100 words.
+        for idx, _ in enumerate(range(randrange(min, max))):
+            while True:
+                word = choice(words)
+                if word != last:
+                    last = word
+                    break
+            if next_capitalized:
+                word = word.capitalize()
+                next_capitalized = False
+            # add commas
+            if idx - randrange(3, 8) > last_comma:
+                last_comma = idx
+                last_fullstop += 2
+                word += ","
+            # add end of sentences
+            if idx - randrange(10, 20) > last_fullstop:
+                last_comma = last_fullstop = idx
+                word += "."
+                next_capitalized = True
+            p.append(word)
 
-    :param app_name: the application name.  This should be properly capitalized
-                     and can contain whitespace.
-    :param roaming: controls if the folder should be roaming or not on Windows.
-                    Has no effect otherwise.
-    :param force_posix: if this is set to `True` then on any POSIX system the
-                        folder will be stored in the home folder with a leading
-                        dot instead of the XDG config home or darwin's
-                        application support folder.
-    """
-    if WIN:
-        key = "APPDATA" if roaming else "LOCALAPPDATA"
-        folder = os.environ.get(key)
-        if folder is None:
-            folder = os.path.expanduser("~")
-        return os.path.join(folder, app_name)
-    if force_posix:
-        return os.path.join(os.path.expanduser(f"~/.{_posixify(app_name)}"))
-    if sys.platform == "darwin":
-        return os.path.join(
-            os.path.expanduser("~/Library/Application Support"), app_name
-        )
-    return os.path.join(
-        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-        _posixify(app_name),
+        # ensure that the paragraph ends with a dot.
+        p_str = " ".join(p)
+
+        if p_str.endswith(","):
+            p_str = p_str[:-1] + "."
+        elif not p_str.endswith("."):
+            p_str += "."
+
+        result.append(p_str)
+
+    if not html:
+        return "\n\n".join(result)
+    return markupsafe.Markup(
+        "\n".join(f"<p>{markupsafe.escape(x)}</p>" for x in result)
     )
 
 
-class PacifyFlushWrapper:
-    """This wrapper is used to catch and suppress BrokenPipeErrors resulting
-    from ``.flush()`` being called on broken pipe during the shutdown/final-GC
-    of the Python interpreter. Notably ``.flush()`` is always called on
-    ``sys.stdout`` and ``sys.stderr``. So as to have minimal impact on any
-    other cleanup code, and the case where the underlying file is not a broken
-    pipe, all calls and attributes are proxied.
+def url_quote(obj: t.Any, charset: str = "utf-8", for_qs: bool = False) -> str:
+    """Quote a string for use in a URL using the given charset.
+
+    :param obj: String or bytes to quote. Other types are converted to
+        string then encoded to bytes using the given charset.
+    :param charset: Encode text to bytes using this charset.
+    :param for_qs: Quote "/" and use "+" for spaces.
     """
+    if not isinstance(obj, bytes):
+        if not isinstance(obj, str):
+            obj = str(obj)
 
-    def __init__(self, wrapped: t.IO[t.Any]) -> None:
-        self.wrapped = wrapped
+        obj = obj.encode(charset)
 
-    def flush(self) -> None:
+    safe = b"" if for_qs else b"/"
+    rv = quote_from_bytes(obj, safe)
+
+    if for_qs:
+        rv = rv.replace("%20", "+")
+
+    return rv
+
+
+@abc.MutableMapping.register
+class LRUCache:
+    """A simple LRU Cache implementation."""
+
+    # this is fast for small capacities (something below 1000) but doesn't
+    # scale.  But as long as it's only used as storage for templates this
+    # won't do any harm.
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self._mapping: t.Dict[t.Any, t.Any] = {}
+        self._queue: te.Deque[t.Any] = deque()
+        self._postinit()
+
+    def _postinit(self) -> None:
+        # alias all queue methods for faster lookup
+        self._popleft = self._queue.popleft
+        self._pop = self._queue.pop
+        self._remove = self._queue.remove
+        self._wlock = Lock()
+        self._append = self._queue.append
+
+    def __getstate__(self) -> t.Mapping[str, t.Any]:
+        return {
+            "capacity": self.capacity,
+            "_mapping": self._mapping,
+            "_queue": self._queue,
+        }
+
+    def __setstate__(self, d: t.Mapping[str, t.Any]) -> None:
+        self.__dict__.update(d)
+        self._postinit()
+
+    def __getnewargs__(self) -> t.Tuple[t.Any, ...]:
+        return (self.capacity,)
+
+    def copy(self) -> "te.Self":
+        """Return a shallow copy of the instance."""
+        rv = self.__class__(self.capacity)
+        rv._mapping.update(self._mapping)
+        rv._queue.extend(self._queue)
+        return rv
+
+    def get(self, key: t.Any, default: t.Any = None) -> t.Any:
+        """Return an item from the cache dict or `default`"""
         try:
-            self.wrapped.flush()
-        except OSError as e:
-            import errno
+            return self[key]
+        except KeyError:
+            return default
 
-            if e.errno != errno.EPIPE:
-                raise
-
-    def __getattr__(self, attr: str) -> t.Any:
-        return getattr(self.wrapped, attr)
-
-
-def _detect_program_name(
-    path: str | None = None, _main: ModuleType | None = None
-) -> str:
-    """Determine the command used to run the program, for use in help
-    text. If a file or entry point was executed, the file name is
-    returned. If ``python -m`` was used to execute a module or package,
-    ``python -m name`` is returned.
-
-    This doesn't try to be too precise, the goal is to give a concise
-    name for help text. Files are only shown as their name without the
-    path. ``python`` is only shown for modules, and the full path to
-    ``sys.executable`` is not shown.
-
-    :param path: The Python file being executed. Python puts this in
-        ``sys.argv[0]``, which is used by default.
-    :param _main: The ``__main__`` module. This should only be passed
-        during internal testing.
-
-    .. versionadded:: 8.0
-        Based on command args detection in the Werkzeug reloader.
-
-    :meta private:
-    """
-    if _main is None:
-        _main = sys.modules["__main__"]
-
-    if not path:
-        path = sys.argv[0]
-
-    # The value of __package__ indicates how Python was called. It may
-    # not exist if a setuptools script is installed as an egg. It may be
-    # set incorrectly for entry points created with pip on Windows.
-    # It is set to "" inside a Shiv or PEX zipapp.
-    if getattr(_main, "__package__", None) in {None, ""} or (
-        os.name == "nt"
-        and _main.__package__ == ""
-        and not os.path.exists(path)
-        and os.path.exists(f"{path}.exe")
-    ):
-        # Executed a file, like "python app.py".
-        return os.path.basename(path)
-
-    # Executed a module, like "python -m example".
-    # Rewritten by Python from "-m script" to "/path/to/script.py".
-    # Need to look at main module to determine how it was executed.
-    py_module = t.cast(str, _main.__package__)
-    name = os.path.splitext(os.path.basename(path))[0]
-
-    # A submodule like "example.cli".
-    if name != "__main__":
-        py_module = f"{py_module}.{name}"
-
-    return f"python -m {py_module.lstrip('.')}"
-
-
-def _expand_args(
-    args: cabc.Iterable[str],
-    *,
-    user: bool = True,
-    env: bool = True,
-    glob_recursive: bool = True,
-) -> list[str]:
-    """Simulate Unix shell expansion with Python functions.
-
-    See :func:`glob.glob`, :func:`os.path.expanduser`, and
-    :func:`os.path.expandvars`.
-
-    This is intended for use on Windows, where the shell does not do any
-    expansion. It may not exactly match what a Unix shell would do.
-
-    :param args: List of command line arguments to expand.
-    :param user: Expand user home directory.
-    :param env: Expand environment variables.
-    :param glob_recursive: ``**`` matches directories recursively.
-
-    .. versionchanged:: 8.1
-        Invalid glob patterns are treated as empty expansions rather
-        than raising an error.
-
-    .. versionadded:: 8.0
-
-    :meta private:
-    """
-    from glob import glob
-
-    out = []
-
-    for arg in args:
-        if user:
-            arg = os.path.expanduser(arg)
-
-        if env:
-            arg = os.path.expandvars(arg)
-
+    def setdefault(self, key: t.Any, default: t.Any = None) -> t.Any:
+        """Set `default` if the key is not in the cache otherwise
+        leave unchanged. Return the value of this key.
+        """
         try:
-            matches = glob(arg, recursive=glob_recursive)
-        except re.error:
-            matches = []
+            return self[key]
+        except KeyError:
+            self[key] = default
+            return default
 
-        if not matches:
-            out.append(arg)
-        else:
-            out.extend(matches)
+    def clear(self) -> None:
+        """Clear the cache."""
+        with self._wlock:
+            self._mapping.clear()
+            self._queue.clear()
 
-    return out
+    def __contains__(self, key: t.Any) -> bool:
+        """Check if a key exists in this cache."""
+        return key in self._mapping
+
+    def __len__(self) -> int:
+        """Return the current size of the cache."""
+        return len(self._mapping)
+
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__} {self._mapping!r}>"
+
+    def __getitem__(self, key: t.Any) -> t.Any:
+        """Get an item from the cache. Moves the item up so that it has the
+        highest priority then.
+
+        Raise a `KeyError` if it does not exist.
+        """
+        with self._wlock:
+            rv = self._mapping[key]
+
+            if self._queue[-1] != key:
+                try:
+                    self._remove(key)
+                except ValueError:
+                    # if something removed the key from the container
+                    # when we read, ignore the ValueError that we would
+                    # get otherwise.
+                    pass
+
+                self._append(key)
+
+            return rv
+
+    def __setitem__(self, key: t.Any, value: t.Any) -> None:
+        """Sets the value for an item. Moves the item up so that it
+        has the highest priority then.
+        """
+        with self._wlock:
+            if key in self._mapping:
+                self._remove(key)
+            elif len(self._mapping) == self.capacity:
+                del self._mapping[self._popleft()]
+
+            self._append(key)
+            self._mapping[key] = value
+
+    def __delitem__(self, key: t.Any) -> None:
+        """Remove an item from the cache dict.
+        Raise a `KeyError` if it does not exist.
+        """
+        with self._wlock:
+            del self._mapping[key]
+
+            try:
+                self._remove(key)
+            except ValueError:
+                pass
+
+    def items(self) -> t.Iterable[t.Tuple[t.Any, t.Any]]:
+        """Return a list of items."""
+        result = [(key, self._mapping[key]) for key in list(self._queue)]
+        result.reverse()
+        return result
+
+    def values(self) -> t.Iterable[t.Any]:
+        """Return a list of all values."""
+        return [x[1] for x in self.items()]
+
+    def keys(self) -> t.Iterable[t.Any]:
+        """Return a list of all keys ordered by most recent usage."""
+        return list(self)
+
+    def __iter__(self) -> t.Iterator[t.Any]:
+        return reversed(tuple(self._queue))
+
+    def __reversed__(self) -> t.Iterator[t.Any]:
+        """Iterate over the keys in the cache dict, oldest items
+        coming first.
+        """
+        return iter(tuple(self._queue))
+
+    __copy__ = copy
+
+
+def select_autoescape(
+    enabled_extensions: t.Collection[str] = ("html", "htm", "xml"),
+    disabled_extensions: t.Collection[str] = (),
+    default_for_string: bool = True,
+    default: bool = False,
+) -> t.Callable[[t.Optional[str]], bool]:
+    """Intelligently sets the initial value of autoescaping based on the
+    filename of the template.  This is the recommended way to configure
+    autoescaping if you do not want to write a custom function yourself.
+
+    If you want to enable it for all templates created from strings or
+    for all templates with `.html` and `.xml` extensions::
+
+        from jinja2 import Environment, select_autoescape
+        env = Environment(autoescape=select_autoescape(
+            enabled_extensions=('html', 'xml'),
+            default_for_string=True,
+        ))
+
+    Example configuration to turn it on at all times except if the template
+    ends with `.txt`::
+
+        from jinja2 import Environment, select_autoescape
+        env = Environment(autoescape=select_autoescape(
+            disabled_extensions=('txt',),
+            default_for_string=True,
+            default=True,
+        ))
+
+    The `enabled_extensions` is an iterable of all the extensions that
+    autoescaping should be enabled for.  Likewise `disabled_extensions` is
+    a list of all templates it should be disabled for.  If a template is
+    loaded from a string then the default from `default_for_string` is used.
+    If nothing matches then the initial value of autoescaping is set to the
+    value of `default`.
+
+    For security reasons this function operates case insensitive.
+
+    .. versionadded:: 2.9
+    """
+    enabled_patterns = tuple(f".{x.lstrip('.').lower()}" for x in enabled_extensions)
+    disabled_patterns = tuple(f".{x.lstrip('.').lower()}" for x in disabled_extensions)
+
+    def autoescape(template_name: t.Optional[str]) -> bool:
+        if template_name is None:
+            return default_for_string
+        template_name = template_name.lower()
+        if template_name.endswith(enabled_patterns):
+            return True
+        if template_name.endswith(disabled_patterns):
+            return False
+        return default
+
+    return autoescape
+
+
+def htmlsafe_json_dumps(
+    obj: t.Any, dumps: t.Optional[t.Callable[..., str]] = None, **kwargs: t.Any
+) -> markupsafe.Markup:
+    """Serialize an object to a string of JSON with :func:`json.dumps`,
+    then replace HTML-unsafe characters with Unicode escapes and mark
+    the result safe with :class:`~markupsafe.Markup`.
+
+    This is available in templates as the ``|tojson`` filter.
+
+    The following characters are escaped: ``<``, ``>``, ``&``, ``'``.
+
+    The returned string is safe to render in HTML documents and
+    ``<script>`` tags. The exception is in HTML attributes that are
+    double quoted; either use single quotes or the ``|forceescape``
+    filter.
+
+    :param obj: The object to serialize to JSON.
+    :param dumps: The ``dumps`` function to use. Defaults to
+        ``env.policies["json.dumps_function"]``, which defaults to
+        :func:`json.dumps`.
+    :param kwargs: Extra arguments to pass to ``dumps``. Merged onto
+        ``env.policies["json.dumps_kwargs"]``.
+
+    .. versionchanged:: 3.0
+        The ``dumper`` parameter is renamed to ``dumps``.
+
+    .. versionadded:: 2.9
+    """
+    if dumps is None:
+        dumps = json.dumps
+
+    return markupsafe.Markup(
+        dumps(obj, **kwargs)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("'", "\\u0027")
+    )
+
+
+class Cycler:
+    """Cycle through values by yield them one at a time, then restarting
+    once the end is reached. Available as ``cycler`` in templates.
+
+    Similar to ``loop.cycle``, but can be used outside loops or across
+    multiple loops. For example, render a list of folders and files in a
+    list, alternating giving them "odd" and "even" classes.
+
+    .. code-block:: html+jinja
+
+        {% set row_class = cycler("odd", "even") %}
+        <ul class="browser">
+        {% for folder in folders %}
+          <li class="folder {{ row_class.next() }}">{{ folder }}
+        {% endfor %}
+        {% for file in files %}
+          <li class="file {{ row_class.next() }}">{{ file }}
+        {% endfor %}
+        </ul>
+
+    :param items: Each positional argument will be yielded in the order
+        given for each cycle.
+
+    .. versionadded:: 2.1
+    """
+
+    def __init__(self, *items: t.Any) -> None:
+        if not items:
+            raise RuntimeError("at least one item has to be provided")
+        self.items = items
+        self.pos = 0
+
+    def reset(self) -> None:
+        """Resets the current item to the first item."""
+        self.pos = 0
+
+    @property
+    def current(self) -> t.Any:
+        """Return the current item. Equivalent to the item that will be
+        returned next time :meth:`next` is called.
+        """
+        return self.items[self.pos]
+
+    def next(self) -> t.Any:
+        """Return the current item, then advance :attr:`current` to the
+        next item.
+        """
+        rv = self.current
+        self.pos = (self.pos + 1) % len(self.items)
+        return rv
+
+    __next__ = next
+
+
+class Joiner:
+    """A joining helper for templates."""
+
+    def __init__(self, sep: str = ", ") -> None:
+        self.sep = sep
+        self.used = False
+
+    def __call__(self) -> str:
+        if not self.used:
+            self.used = True
+            return ""
+        return self.sep
+
+
+class Namespace:
+    """A namespace object that can hold arbitrary attributes.  It may be
+    initialized from a dictionary or with keyword arguments."""
+
+    def __init__(*args: t.Any, **kwargs: t.Any) -> None:  # noqa: B902
+        self, args = args[0], args[1:]
+        self.__attrs = dict(*args, **kwargs)
+
+    def __getattribute__(self, name: str) -> t.Any:
+        # __class__ is needed for the awaitable check in async mode
+        if name in {"_Namespace__attrs", "__class__"}:
+            return object.__getattribute__(self, name)
+        try:
+            return self.__attrs[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def __setitem__(self, name: str, value: t.Any) -> None:
+        self.__attrs[name] = value
+
+    def __repr__(self) -> str:
+        return f"<Namespace {self.__attrs!r}>"

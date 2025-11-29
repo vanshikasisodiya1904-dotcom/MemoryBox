@@ -1,73 +1,73 @@
 Metadata-Version: 2.4
-Name: click
-Version: 8.3.1
-Summary: Composable command line interface toolkit
+Name: Jinja2
+Version: 3.1.6
+Summary: A very fast and expressive template engine.
 Maintainer-email: Pallets <contact@palletsprojects.com>
-Requires-Python: >=3.10
+Requires-Python: >=3.7
 Description-Content-Type: text/markdown
-License-Expression: BSD-3-Clause
 Classifier: Development Status :: 5 - Production/Stable
+Classifier: Environment :: Web Environment
 Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: BSD License
 Classifier: Operating System :: OS Independent
 Classifier: Programming Language :: Python
+Classifier: Topic :: Internet :: WWW/HTTP :: Dynamic Content
+Classifier: Topic :: Text Processing :: Markup :: HTML
 Classifier: Typing :: Typed
 License-File: LICENSE.txt
-Requires-Dist: colorama; platform_system == 'Windows'
-Project-URL: Changes, https://click.palletsprojects.com/page/changes/
+Requires-Dist: MarkupSafe>=2.0
+Requires-Dist: Babel>=2.7 ; extra == "i18n"
+Project-URL: Changes, https://jinja.palletsprojects.com/changes/
 Project-URL: Chat, https://discord.gg/pallets
-Project-URL: Documentation, https://click.palletsprojects.com/
+Project-URL: Documentation, https://jinja.palletsprojects.com/
 Project-URL: Donate, https://palletsprojects.com/donate
-Project-URL: Source, https://github.com/pallets/click/
+Project-URL: Source, https://github.com/pallets/jinja/
+Provides-Extra: i18n
 
-<div align="center"><img src="https://raw.githubusercontent.com/pallets/click/refs/heads/stable/docs/_static/click-name.svg" alt="" height="150"></div>
+# Jinja
 
-# Click
+Jinja is a fast, expressive, extensible templating engine. Special
+placeholders in the template allow writing code similar to Python
+syntax. Then the template is passed data to render the final document.
 
-Click is a Python package for creating beautiful command line interfaces
-in a composable way with as little code as necessary. It's the "Command
-Line Interface Creation Kit". It's highly configurable but comes with
-sensible defaults out of the box.
+It includes:
 
-It aims to make the process of writing command line tools quick and fun
-while also preventing any frustration caused by the inability to
-implement an intended CLI API.
+-   Template inheritance and inclusion.
+-   Define and import macros within templates.
+-   HTML templates can use autoescaping to prevent XSS from untrusted
+    user input.
+-   A sandboxed environment can safely render untrusted templates.
+-   AsyncIO support for generating templates and calling async
+    functions.
+-   I18N support with Babel.
+-   Templates are compiled to optimized Python code just-in-time and
+    cached, or can be compiled ahead-of-time.
+-   Exceptions point to the correct line in templates to make debugging
+    easier.
+-   Extensible filters, tests, functions, and even syntax.
 
-Click in three points:
-
--   Arbitrary nesting of commands
--   Automatic help page generation
--   Supports lazy loading of subcommands at runtime
+Jinja's philosophy is that while application logic belongs in Python if
+possible, it shouldn't make the template designer's job difficult by
+restricting functionality too much.
 
 
-## A Simple Example
+## In A Nutshell
 
-```python
-import click
-
-@click.command()
-@click.option("--count", default=1, help="Number of greetings.")
-@click.option("--name", prompt="Your name", help="The person to greet.")
-def hello(count, name):
-    """Simple program that greets NAME for a total of COUNT times."""
-    for _ in range(count):
-        click.echo(f"Hello, {name}!")
-
-if __name__ == '__main__':
-    hello()
+```jinja
+{% extends "base.html" %}
+{% block title %}Members{% endblock %}
+{% block content %}
+  <ul>
+  {% for user in users %}
+    <li><a href="{{ user.url }}">{{ user.username }}</a></li>
+  {% endfor %}
+  </ul>
+{% endblock %}
 ```
-
-```
-$ python hello.py --count=3
-Your name: Click
-Hello, Click!
-Hello, Click!
-Hello, Click!
-```
-
 
 ## Donate
 
-The Pallets organization develops and supports Click and other popular
+The Pallets organization develops and supports Jinja and other popular
 packages. In order to grow the community of contributors and users, and
 allow the maintainers to devote more time to the projects, [please
 donate today][].
